@@ -3,7 +3,14 @@ import { PublicKey } from "@solana/web3.js";
 import { validateSlab, isBlockedSlab } from "../middleware/validateSlab.js";
 import { cacheMiddleware } from "../middleware/cache.js";
 import { withDbCacheFallback } from "../middleware/db-cache-fallback.js";
-import { fetchSlab, parseHeader, parseConfig, parseEngine } from "@percolatorct/sdk";
+import {
+  fetchSlab,
+  parseHeader,
+  parseConfig,
+  parseEngine,
+  isV17Account,
+  parseWrapperConfigV17,
+} from "@percolatorct/sdk";
 import { getConnection, getSupabase, getNetwork, createLogger, sanitizeSlabAddress, truncateErrorMessage } from "@percolator/shared";
 
 const logger = createLogger("api:markets");
@@ -117,6 +124,8 @@ export function marketRoutes(): Hono {
   });
 
   // GET /markets/:slab — single market details (on-chain read) — 10s cache
+  // Supports both v12.x slabs (parseConfig path) and v17 market-group accounts
+  // (parseWrapperConfigV17 path). isV17Account() detects the magic + version.
   app.get("/markets/:slab", cacheMiddleware(10), validateSlab, async (c) => {
     const slab = c.req.param("slab");
     if (!slab) return c.json({ error: "slab required" }, 400);
@@ -124,12 +133,41 @@ export function marketRoutes(): Hono {
       const connection = getConnection();
       const slabPubkey = new PublicKey(slab);
       const data = await fetchSlab(connection, slabPubkey);
+
+      if (isV17Account(data)) {
+        // v17 market-group account: 16-byte header + 432-byte WrapperConfigV16.
+        // No engine block — stats come from the indexer DB, not the on-chain account.
+        const cfg = parseWrapperConfigV17(data);
+        return c.json({
+          slabAddress: slab,
+          accountVersion: 17,
+          header: {
+            // v17 header is 16 bytes: magic(8)+version(2)+kind(1)+pad(1)+reserved(4).
+            // No admin field — authority is cfg.marketauth.
+            magic: "0x5045524356313600",
+            version: 17,
+            marketauth: cfg.marketauth.toBase58(),
+          },
+          config: {
+            collateralMint: cfg.collateralMint.toBase58(),
+            marketauth: cfg.marketauth.toBase58(),
+            tradeFeeBps: cfg.tradeFeeBps.toString(),
+            unitScale: cfg.unitScale,
+          },
+          // v17 engine state is per-portfolio, not in the market-group account.
+          // Clients should query /markets/:slab/stats for indexed state.
+          engine: null,
+        });
+      }
+
+      // v12.x slab: legacy path
       const header = parseHeader(data);
       const cfg = parseConfig(data);
       const engine = parseEngine(data);
 
       return c.json({
         slabAddress: slab,
+        accountVersion: header.version,
         header: {
           magic: header.magic.toString(),
           version: header.version,

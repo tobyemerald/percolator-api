@@ -76,8 +76,9 @@ describe("crank routes", () => {
       expect(res.status).toBe(200);
       const data = await res.json();
       expect(data.markets).toHaveLength(2);
-      expect(data.markets[0].slab_address).toBe("11111111111111111111111111111111");
-      expect(data.markets[0].last_crank_slot).toBe(123456789);
+      // v17: response uses camelCase field names
+      expect(data.markets[0].slabAddress).toBe("11111111111111111111111111111111");
+      expect(data.markets[0].lastCrankSlot).toBe(123456789);
     });
 
     it("should handle empty markets list", async () => {
@@ -108,8 +109,9 @@ describe("crank routes", () => {
       expect(res.status).toBe(200);
       const data = await res.json();
       expect(data.markets).toHaveLength(1);
-      expect(data.markets[0].last_crank_slot).toBeNull();
-      expect(data.markets[0].updated_at).toBeNull();
+      // v17: camelCase field names
+      expect(data.markets[0].lastCrankSlot).toBeNull();
+      expect(data.markets[0].updatedAt).toBeNull();
     });
 
     it("should handle database errors", async () => {
@@ -142,9 +144,13 @@ describe("crank routes", () => {
 
       expect(res.status).toBe(200);
       const data = await res.json();
-      expect(data.markets[0]).toHaveProperty("slab_address");
-      expect(data.markets[0]).toHaveProperty("last_crank_slot");
-      expect(data.markets[0]).toHaveProperty("updated_at");
+      // v17: camelCase field names; assetIndex added for per-asset crank tracking
+      expect(data.markets[0]).toHaveProperty("slabAddress");
+      expect(data.markets[0]).toHaveProperty("lastCrankSlot");
+      expect(data.markets[0]).toHaveProperty("updatedAt");
+      expect(data.markets[0]).toHaveProperty("assetIndex");
+      // pre-v17 rows have no asset_index → defaults to 0
+      expect(data.markets[0].assetIndex).toBe(0);
     });
 
     it("should handle large slot numbers", async () => {
@@ -163,7 +169,8 @@ describe("crank routes", () => {
 
       expect(res.status).toBe(200);
       const data = await res.json();
-      expect(data.markets[0].last_crank_slot).toBe(999999999999);
+      // v17: camelCase
+      expect(data.markets[0].lastCrankSlot).toBe(999999999999);
     });
 
     it("should preserve order from database", async () => {
@@ -193,9 +200,10 @@ describe("crank routes", () => {
       expect(res.status).toBe(200);
       const data = await res.json();
       expect(data.markets).toHaveLength(3);
-      expect(data.markets[0].slab_address).toBe("33333333333333333333333333333333");
-      expect(data.markets[1].slab_address).toBe("11111111111111111111111111111111");
-      expect(data.markets[2].slab_address).toBe("22222222222222222222222222222222");
+      // v17: camelCase slabAddress
+      expect(data.markets[0].slabAddress).toBe("33333333333333333333333333333333");
+      expect(data.markets[1].slabAddress).toBe("11111111111111111111111111111111");
+      expect(data.markets[2].slabAddress).toBe("22222222222222222222222222222222");
     });
   });
 });

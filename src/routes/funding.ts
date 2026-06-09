@@ -35,6 +35,17 @@ const logger = createLogger("api:funding");
  * Maximum valid funding rate in bps/slot (matches on-chain guard).
  * Raw DB values outside [-MAX, MAX] are garbage from uninitialized slabs.
  * Returns 0 for garbage values to avoid rendering astronomical percentages.
+ *
+ * v17 NOTE: In v17 the on-chain engine stores funding_rate_e9 (i128 in e9 units)
+ * which the PermissionlessCrank hardcodes to 0n (hard-rejected if nonzero). The
+ * DB column `funding_rate` is written by the v17 indexer — the unit stored there
+ * is the same bps/slot representation this route already uses, derived by the
+ * indexer from the engine's `fundingRateBpsPerSlotLast` field. No change needed
+ * in this file; the response shape is forward-compatible with v17 indexer output.
+ *
+ * v17 also introduces per-asset funding (domain u16 replaces domain u8). The DB
+ * row for multi-asset markets is keyed by (slab_address, asset_index). The response
+ * includes `assetIndex` from the DB row when present; pre-v17 markets default to 0.
  */
 const MAX_FUNDING_RATE_BPS = 10_000;
 function sanitizeFundingRateBps(raw: number): number {
@@ -60,7 +71,7 @@ export function fundingRoutes(): Hono {
       async () => {
         const { data: allStats, error } = await getSupabase()
           .from("markets_with_stats")
-          .select("slab_address, funding_rate, net_lp_pos")
+          .select("slab_address, funding_rate, net_lp_pos, asset_index")
           .eq("network", getNetwork())
           .not("slab_address", "is", null);
 
@@ -76,6 +87,10 @@ export function fundingRoutes(): Hono {
             const rateBps = sanitizeFundingRateBps(Number(stats.funding_rate ?? 0));
             return {
               slabAddress: stats.slab_address,
+              // v17: per-asset index. Pre-v17 rows have no asset_index column (defaults to 0).
+              assetIndex: (stats as Record<string, unknown>).asset_index != null
+                ? Number((stats as Record<string, unknown>).asset_index)
+                : 0,
               currentRateBpsPerSlot: rateBps,
               hourlyRatePercent: Number(((rateBps / 10000.0) * SLOTS_PER_HOUR).toFixed(6)),
               dailyRatePercent: Number(((rateBps / 10000.0) * SLOTS_PER_DAY).toFixed(4)),
@@ -123,7 +138,8 @@ export function fundingRoutes(): Hono {
       // metadata.last_price. Falls back gracefully if market row is missing.
       const { data: stats, error: statsError } = await getSupabase()
         .from("markets_with_stats")
-        .select("funding_rate, net_lp_pos, symbol, last_price")
+        // v17: select asset_index for per-asset funding. Pre-v17 rows return null → default 0.
+        .select("funding_rate, net_lp_pos, symbol, last_price, asset_index")
         .eq("slab_address", slab)
         .single();
 
@@ -185,6 +201,10 @@ export function fundingRoutes(): Hono {
 
       return c.json({
         slabAddress: slab,
+        // v17: per-asset index. Pre-v17 rows have no asset_index column (null → 0).
+        assetIndex: (stats as Record<string, unknown>).asset_index != null
+          ? Number((stats as Record<string, unknown>).asset_index)
+          : 0,
         currentRateBpsPerSlot: rateBps,
         hourlyRatePercent: Number(hourlyRatePercent.toFixed(6)),
         dailyRatePercent: Number(dailyRatePercent.toFixed(4)),

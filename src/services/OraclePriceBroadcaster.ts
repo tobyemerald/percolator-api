@@ -16,6 +16,13 @@
  * publication:
  *
  *   ALTER PUBLICATION supabase_realtime ADD TABLE oracle_prices;
+ *
+ * v17 NOTE: In v17 the keeper no longer dispatches a standalone oracle-push
+ * instruction. Oracle prices are updated as a side-effect of PermissionlessCrank
+ * (tag 5). The indexer will populate `oracle_prices` rows when it indexes crank
+ * transactions. This broadcaster is correct as written — it will be a no-op until
+ * the v17 indexer is deployed. No code change required here.
+ * Reference: V17_SWEEP_RECONCILIATION_2026-06-08.md § "keeper" downstream specifics.
  */
 import { eventBus, getSupabase, getNetwork, createLogger } from "@percolator/shared";
 import type { RealtimeChannel } from "@supabase/supabase-js";

@@ -7,8 +7,13 @@
  * This test does NOT make RPC calls. Everything is pure in-process computation so it
  * runs reliably in CI without any environment secrets.
  *
- * Pinned version: @percolatorct/sdk@1.0.0-beta.33
- * Update this comment when the workflow pins a new version.
+ * Pinned version: @percolatorct/sdk@3.0.0  (v17 ABI — breaking from beta.34)
+ * v17 breaking changes visible here:
+ *   - buildAdlInstruction() throws at runtime (ExecuteAdl tag 101 removed in v17 wrapper)
+ *   - encodeKeeperCrank() throws (use encodePermissionlessCrank())
+ *   - WRAPPER_CONFIG_LEN: 624 → 432 (V17_WRAPPER_CONFIG_LEN)
+ *   - New: parseWrapperConfigV17(), parseAssetOracleProfileV17(), isV17Account()
+ *   - PermissionlessCrank hardcodes fundingRateE9=0n — arg present on wire but MUST be 0
  */
 
 import { describe, it, expect } from "vitest";
@@ -27,6 +32,13 @@ import {
   ENGINE_OFF,
   ENGINE_MARK_PRICE_OFF,
   SLAB_TIERS_V12_17,
+  // v17 layout constants + parsers
+  V17_WRAPPER_CONFIG_LEN,
+  V17_ASSET_ORACLE_PROFILE_LEN,
+  V17_MARKET_GROUP_OFF,
+  parseWrapperConfigV17,
+  parseAssetOracleProfileV17,
+  isV17Account,
   // solana/adl.ts  (used by adl.ts route)
   rankAdlPositions,
   isAdlTriggered,
@@ -44,6 +56,9 @@ import {
   PROGRAM_IDS,
   // oracle/price-router.ts  (used by oracle-router.ts route)
   resolvePrice,
+  // v17 crank encoder
+  encodePermissionlessCrank,
+  encodeKeeperCrank,
 } from "@percolatorct/sdk";
 
 // Type-only imports — these exercise the .d.ts surface without runtime cost.
@@ -55,6 +70,9 @@ import type {
   AdlRankingResult,
   AdlRankedPosition,
   PriceRouterResult,
+  // v17 types
+  WrapperConfigV17,
+  AssetOracleProfileV17,
 } from "@percolatorct/sdk";
 
 // ── 2. Constants ──────────────────────────────────────────────────────────────
@@ -287,5 +305,82 @@ describe("@percolatorct/sdk exports — function shapes", () => {
 
   it("resolvePrice is a function", () => {
     expect(typeof resolvePrice).toBe("function");
+  });
+});
+
+// ── 9. v17 ABI — removed + renamed encoders ──────────────────────────────────
+// v17 removes ExecuteAdl (tag 101) and replaces KeeperCrank with PermissionlessCrank.
+// Both old functions are still exported but throw at call time.
+
+import { PublicKey as SolanaPublicKey } from "@solana/web3.js";
+
+const DUMMY_KEY = new SolanaPublicKey("11111111111111111111111111111111");
+
+describe("@percolatorct/sdk v17 — removed instruction guards", () => {
+  it("encodeKeeperCrank throws — replaced by encodePermissionlessCrank in v17", () => {
+    // KeeperCrankArgs takes { callerIdx, candidates? } — any call throws in v17.
+    expect(() =>
+      encodeKeeperCrank({ callerIdx: 0 })
+    ).toThrow();
+  });
+
+  it("buildAdlInstruction throws — ExecuteAdl (tag 101) removed from v17 wrapper", () => {
+    // buildAdlInstruction calls encodeExecuteAdl which throws removedInstruction().
+    // The API's /adl/rankings route does NOT call this — it uses parseAllAccounts
+    // + its own ranking logic. This test documents the v17 behavior.
+    expect(() =>
+      buildAdlInstruction(DUMMY_KEY, DUMMY_KEY, DUMMY_KEY, DUMMY_KEY, 0)
+    ).toThrow("not in v17");
+  });
+
+  it("encodePermissionlessCrank is a function and hardcodes fundingRateE9=0n on-wire", () => {
+    // v17 replacement for encodeKeeperCrank. The arg struct does NOT expose
+    // fundingRateE9 — the encoder always writes 0n internally. The on-chain
+    // handler hard-rejects any nonzero value with InvalidInstructionData.
+    expect(typeof encodePermissionlessCrank).toBe("function");
+    const bytes = encodePermissionlessCrank({
+      action: 0,
+      assetIndex: 0,
+      nowSlot: 123n,
+      closeQ: 0n,
+      feeBps: 0n,
+      recoveryReason: 0,
+    });
+    expect(bytes).toBeInstanceOf(Uint8Array);
+    // tag(1) + action(1) + assetIndex(2) + nowSlot(8) + fundingRateE9(16)
+    //   + closeQ(16) + feeBps(8) + recoveryReason(1) = 53 bytes
+    expect(bytes.length).toBe(53);
+  });
+});
+
+// ── 10. v17 layout constants ──────────────────────────────────────────────────
+
+describe("@percolatorct/sdk v17 — layout constants", () => {
+  it("V17_WRAPPER_CONFIG_LEN is 432 (down from 624)", () => {
+    expect(V17_WRAPPER_CONFIG_LEN).toBe(432);
+  });
+
+  it("V17_ASSET_ORACLE_PROFILE_LEN is 400 (up from 368, +asset_admin)", () => {
+    expect(V17_ASSET_ORACLE_PROFILE_LEN).toBe(400);
+  });
+
+  it("V17_MARKET_GROUP_OFF is 448 (HEADER_LEN 16 + CONFIG_LEN 432)", () => {
+    expect(V17_MARKET_GROUP_OFF).toBe(448);
+  });
+
+  it("parseWrapperConfigV17 is a function", () => {
+    expect(typeof parseWrapperConfigV17).toBe("function");
+  });
+
+  it("parseAssetOracleProfileV17 is a function", () => {
+    expect(typeof parseAssetOracleProfileV17).toBe("function");
+  });
+
+  it("isV17Account is a function", () => {
+    expect(typeof isV17Account).toBe("function");
+  });
+
+  it("isV17Account returns false for an all-zero buffer (wrong magic)", () => {
+    expect(isV17Account(new Uint8Array(512))).toBe(false);
   });
 });

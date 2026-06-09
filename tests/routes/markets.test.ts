@@ -31,6 +31,10 @@ vi.mock("@percolatorct/sdk", () => ({
   parseHeader: vi.fn(),
   parseConfig: vi.fn(),
   parseEngine: vi.fn(),
+  // v17: isV17Account detects v17 market-group accounts by magic+version.
+  // Default to false so existing tests continue to exercise the v12 parse path.
+  isV17Account: vi.fn(() => false),
+  parseWrapperConfigV17: vi.fn(),
 }));
 
 const { getConnection, getSupabase } = await import("@percolator/shared");

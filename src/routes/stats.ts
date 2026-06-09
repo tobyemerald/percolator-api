@@ -44,6 +44,11 @@ export function statsRoutes(): Hono {
 
       // Aggregate stats from markets_with_stats view — filter by network to
       // prevent cross-network volume/OI inflation in shared DB deployments.
+      // v17 NOTE: In v17 a single market_group may host multiple assets (asset_index > 0).
+      // The view must aggregate per-asset OI into the single slab_address row, or the
+      // query here must deduplicate. The v17 indexer is responsible for this aggregation
+      // in the DB view. This query remains correct as long as the view exposes one row
+      // per slab (not one per slab+asset).
       const { data: stats, error: statsError } = await getSupabase()
         .from("markets_with_stats")
         .select("volume_24h, total_open_interest")
