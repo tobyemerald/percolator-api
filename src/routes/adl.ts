@@ -44,6 +44,7 @@ import {
   parseEngine,
   parseConfig,
   parseAllAccounts,
+  isV17Account,
 } from "@percolatorct/sdk";
 import {
   getConnection,
@@ -103,6 +104,20 @@ interface RankedPosition {
 }
 
 function rankProfitablePositions(data: Uint8Array): RankedPosition[] {
+  // v17 desync fix (PERC-DESYNC-1 / blocker): in v17 the market-group account
+  // uses V17_MAGIC ("PERCV16\0") and does NOT embed portfolio accounts in the slab.
+  // Portfolios are standalone on-chain accounts. parseAllAccounts() is v12-only
+  // (bitmap-indexed embedded layout). Detect v17 and return empty — the ADL
+  // trigger state (capExceeded / utilizationTriggered) is still surfaced; ranking
+  // requires a separate portfolio-scan path not implemented at the API layer.
+  if (isV17Account(data)) {
+    logger.warn(
+      "rankProfitablePositions: v17 market-group account detected — " +
+      "portfolio positions are standalone accounts and cannot be ranked from slab bytes. " +
+      "Returning empty rankings; ADL trigger state is still valid.",
+    );
+    return [];
+  }
   const allAccounts = parseAllAccounts(data);
   const profitable: Array<{
     idx: number;
@@ -189,6 +204,24 @@ export function adlRoutes(): Hono {
       }
       logger.error("fetchSlab failed", { slab, error: msg });
       return c.json({ error: "Failed to fetch slab data" }, 500);
+    }
+
+    // v17 desync fix (PERC-DESYNC-1 / blocker): v17 market-group accounts have a
+    // different magic ("PERCV16\0") and layout — parseEngine/parseConfig expect the
+    // v12.x "PERCOLAT" slab magic and will throw on v17 data. Detect early and return
+    // a clear actionable error instead of the generic "may be uninitialized" message.
+    if (isV17Account(data)) {
+      logger.warn("adl/rankings: v17 market-group account — portfolio positions are standalone accounts", { slab });
+      return c.json(
+        {
+          error:
+            "v17 market detected: portfolio positions are stored in standalone on-chain accounts " +
+            "and cannot be read from the market-group account. ADL ranking is not available " +
+            "via this endpoint for v17 markets.",
+          slab,
+        },
+        400,
+      );
     }
 
     let engine: ReturnType<typeof parseEngine>;

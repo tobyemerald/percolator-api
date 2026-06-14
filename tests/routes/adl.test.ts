@@ -22,10 +22,13 @@ vi.mock("@percolatorct/sdk", () => ({
   parseEngine: vi.fn(),
   parseConfig: vi.fn(),
   parseAllAccounts: vi.fn(),
+  // v17 desync fix: isV17Account defaults to false so existing tests treat data
+  // as v12 slab data; individual tests override with mockReturnValueOnce(true).
+  isV17Account: vi.fn(() => false),
 }));
 
 const { getConnection } = await import("@percolator/shared");
-const { fetchSlab, parseEngine, parseConfig, parseAllAccounts } =
+const { fetchSlab, parseEngine, parseConfig, parseAllAccounts, isV17Account } =
   await import("@percolatorct/sdk");
 
 // ── helpers ────────────────────────────────────────────────────────────────
@@ -69,6 +72,9 @@ describe("GET /api/adl/rankings", () => {
     vi.mocked(parseEngine).mockReturnValue(makeEngine() as any);
     vi.mocked(parseConfig).mockReturnValue(makeConfig() as any);
     vi.mocked(parseAllAccounts).mockReturnValue([]);
+    // Default: treat all test data as v12 slab (not v17). Tests that exercise
+    // the v17 path override with mockReturnValueOnce(true).
+    vi.mocked(isV17Account).mockReturnValue(false);
   });
 
   it("returns 400 when slab param is missing", async () => {
@@ -93,6 +99,19 @@ describe("GET /api/adl/rankings", () => {
     expect(res.status).toBe(404);
     const body = await res.json();
     expect(body.error).toMatch(/not found/i);
+  });
+
+  it("returns 400 with clear v17 message when a v17 market-group account is detected (PERC-DESYNC-1)", async () => {
+    // v17 desync fix: isV17Account returns true — route must detect early and
+    // return a clear error rather than attempting v12 slab parsing.
+    vi.mocked(isV17Account).mockReturnValueOnce(true);
+    const res = await makeRequest(`?slab=${VALID_SLAB}`);
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toMatch(/v17 market/i);
+    expect(body.slab).toBe(VALID_SLAB);
+    // parseEngine must NOT have been called for v17 accounts
+    expect(parseEngine).not.toHaveBeenCalled();
   });
 
   it("returns adlNeeded=false when pnlPosTot ≤ maxPnlCap and utilization ok", async () => {
