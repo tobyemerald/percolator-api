@@ -80,7 +80,7 @@ export function fundingRoutes(): Hono {
         // GH#1459: Filter blocked slabs from the global response.
         // validateSlab middleware only runs on /:slab routes; the global endpoint
         // queries all market_stats rows and previously exposed blocked slabs
-        // (8eFFEFBY, 3bmCyPee, 3YDqCJGz, 3ZKKwsK) with phantom netLpPosition values.
+        // (8eFFEFBY, 3bmCyPee, 3YDqCJGz, 3ZKKwsK) with phantom netLpPos values.
         const markets = (allStats ?? [])
           .filter((stats) => !isBlockedSlab(stats.slab_address))
           .map((stats) => {
@@ -94,7 +94,7 @@ export function fundingRoutes(): Hono {
               currentRateBpsPerSlot: rateBps,
               hourlyRatePercent: Number(((rateBps / 10000.0) * SLOTS_PER_HOUR).toFixed(6)),
               dailyRatePercent: Number(((rateBps / 10000.0) * SLOTS_PER_DAY).toFixed(4)),
-              netLpPosition: stats.net_lp_pos ?? "0",
+              netLpPos: stats.net_lp_pos ?? "0",
             };
           });
 
@@ -103,10 +103,13 @@ export function fundingRoutes(): Hono {
       c
     );
 
-    // withDbCacheFallback returns a Response on failure (503 with stale data or error)
+    // withDbCacheFallback returns a Response on failure (503 when both the
+    // query failed and no usable cache exists). On success — fresh or stale
+    // fallback — it returns a DbCacheResult; staleness HTTP headers are
+    // already set on the context by the middleware.
     if (result instanceof Response) return result;
 
-    return c.json(result);
+    return c.json(result.data);
   });
 
   /**
@@ -120,7 +123,7 @@ export function fundingRoutes(): Hono {
    *   "hourlyRatePercent": 0.42,
    *   "dailyRatePercent": 10.08,
    *   "annualizedPercent": 3679.2,
-   *   "netLpPosition": "1500000",
+   *   "netLpPos": "1500000",
    *   "fundingIndexQpbE6": "123456789",
    *   "lastUpdatedSlot": 123456789,
    *   "last24hHistory": [
@@ -156,7 +159,7 @@ export function fundingRoutes(): Hono {
 
       // Parse current funding data
       const currentRateBpsPerSlot = stats.funding_rate ?? 0;
-      const netLpPosition = stats.net_lp_pos ?? "0";
+      const netLpPos = stats.net_lp_pos ?? "0";
 
       // Calculate rates
       // Solana slots: ~2.5 slots/second = 400ms per slot
@@ -193,8 +196,8 @@ export function fundingRoutes(): Hono {
       }));
 
       // GH#1511: Sanitize last_price from markets_with_stats — same ceiling used
-      // in /api/markets to guard against unscaled admin-set test prices.
-      const MAX_SANE_PRICE_USD = 1_000_000;
+      // in /markets to guard against unscaled admin-set test prices.
+      const MAX_SANE_PRICE_USD = 1_000_000_000;
       const rawLastPrice = Number(stats.last_price ?? 0);
       const sanitizedLastPrice =
         rawLastPrice > 0 && rawLastPrice <= MAX_SANE_PRICE_USD ? rawLastPrice : null;
@@ -209,7 +212,7 @@ export function fundingRoutes(): Hono {
         hourlyRatePercent: Number(hourlyRatePercent.toFixed(6)),
         dailyRatePercent: Number(dailyRatePercent.toFixed(4)),
         annualizedPercent: Number(annualizedPercent.toFixed(2)),
-        netLpPosition,
+        netLpPos,
         last24hHistory,
         metadata: {
           // GH#1511: Populate symbol and last_price from markets_with_stats.

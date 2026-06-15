@@ -12,6 +12,8 @@ import {
   parseWrapperConfigV17,
 } from "@percolatorct/sdk";
 import { getConnection, getSupabase, getNetwork, createLogger, sanitizeSlabAddress, truncateErrorMessage } from "@percolator/shared";
+import { withRpcFallback } from "../utils/rpc-fallback.js";
+import { RpcTimeoutError } from "../utils/rpc-timeout.js";
 
 const logger = createLogger("api:markets");
 
@@ -77,30 +79,37 @@ export function marketRoutes(): Hono {
       c
     );
     
-    // If result is a Response (error case), return it directly
+    // If result is a Response (error case — DB failed AND no usable cache),
+    // return it directly. Otherwise unwrap the DbCacheResult; staleness
+    // headers are already set on the context by the middleware.
     if (result instanceof Response) {
       return result;
     }
-    
-    return c.json({ markets: result });
+
+    return c.json({ markets: result.data });
   });
 
   // GET /markets/stats — all market stats from DB (filtered by network)
   app.get("/markets/stats", async (c) => {
-    try {
-      const { data, error } = await getSupabase()
-        .from("markets_with_stats")
-        .select("slab_address, total_open_interest, total_accounts, last_crank_slot, last_price, mark_price, index_price, funding_rate, net_lp_pos, updated_at")
-        .eq("network", getNetwork())
-        .not("slab_address", "is", null);
-      if (error) throw error;
-      return c.json({ stats: data ?? [] });
-    } catch (err) {
-      logger.error("Error fetching all market stats", {
-        error: truncateErrorMessage(err instanceof Error ? err.message : String(err), 120),
-      });
-      return c.json({ error: "Failed to fetch market stats" }, 500);
+    const result = await withDbCacheFallback(
+      "markets:stats",
+      async () => {
+        const { data, error } = await getSupabase()
+          .from("markets_with_stats")
+          .select("slab_address, total_open_interest, total_accounts, last_crank_slot, last_price, mark_price, index_price, funding_rate, net_lp_pos, lp_sum_abs, lp_max_abs, insurance_balance, insurance_fee_revenue, volume_24h, updated_at")
+          .eq("network", getNetwork())
+          .not("slab_address", "is", null);
+        if (error) throw error;
+        return data ?? [];
+      },
+      c
+    );
+
+    if (result instanceof Response) {
+      return result;
     }
+
+    return c.json({ stats: result.data });
   });
 
   // GET /markets/:slab/stats — single market stats from DB
@@ -109,7 +118,7 @@ export function marketRoutes(): Hono {
     try {
       const { data, error } = await getSupabase()
         .from("market_stats")
-        .select("slab_address, total_open_interest, total_accounts, last_crank_slot, last_price, mark_price, index_price, funding_rate, net_lp_pos, updated_at")
+        .select("slab_address, total_open_interest, total_accounts, last_crank_slot, last_price, mark_price, index_price, funding_rate, net_lp_pos, lp_sum_abs, lp_max_abs, insurance_balance, insurance_fee_revenue, volume_24h, updated_at")
         .eq("slab_address", slab)
         .single();
       if (error && error.code !== "PGRST116") throw error;
@@ -130,9 +139,12 @@ export function marketRoutes(): Hono {
     const slab = c.req.param("slab");
     if (!slab) return c.json({ error: "slab required" }, 400);
     try {
-      const connection = getConnection();
       const slabPubkey = new PublicKey(slab);
-      const data = await fetchSlab(connection, slabPubkey);
+      const data = await withRpcFallback(
+        (conn) => fetchSlab(conn, slabPubkey),
+        getConnection(),
+        `fetchSlab(${slab})`,
+      );
 
       if (isV17Account(data)) {
         // v17 market-group account: 16-byte header + 432-byte WrapperConfigV16.
@@ -188,6 +200,10 @@ export function marketRoutes(): Hono {
         },
       });
     } catch (err) {
+      if (err instanceof RpcTimeoutError) {
+        logger.warn("RPC timeout fetching market", { slab, timeoutMs: err.timeoutMs });
+        return c.json({ error: "Upstream RPC timeout" }, 504);
+      }
       const detail = err instanceof Error ? err.message : "Unknown error";
       const isNotFound = detail.includes("not found") || detail.includes("Account does not exist");
       if (isNotFound) {

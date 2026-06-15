@@ -85,6 +85,13 @@ const CLIENT_MSG_LIMIT = 60; // max 60 messages per minute per client
 // Price update batching configuration
 const PRICE_BATCH_INTERVAL_MS = 500; // Batch price updates every 500ms per slab
 
+// Per-query timeout for the best-effort initial-price fetch in the WS
+// subscribe handler. The handler runs concurrently per message and per
+// channel (up to 50 channels per subscribe), so without a bound a slow
+// Supabase response would let queries pile up per client and exhaust the
+// connection pool. 3s is generous compared to typical sub-100ms reads.
+const WS_INITIAL_PRICE_QUERY_TIMEOUT_MS = 3000;
+
 interface WsClient {
   ws: WebSocket;
   subscriptions: Set<string>; // Channel subscriptions: "price:SOL", "trades:BTC", etc.
@@ -191,6 +198,15 @@ interface PendingPriceUpdate {
 const pendingPriceUpdates = new Map<string, PendingPriceUpdate>();
 const priceUpdateTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
+// References to the eventBus listeners registered inside setupWebSocket().
+// We hold them at module scope so they can be removed via cleanupEventBus
+// Listeners() — both at the start of setupWebSocket() (idempotent re-entry,
+// important for tests that re-import this module) and on graceful shutdown.
+// Without this, repeated calls leak listeners on the shared eventBus singleton.
+let priceUpdatedListener: ((payload: any) => void) | null = null;
+let tradeExecutedListener: ((payload: any) => void) | null = null;
+let fundingUpdatedListener: ((payload: any) => void) | null = null;
+
 // Metrics tracking
 interface Metrics {
   totalConnections: number;
@@ -211,6 +227,40 @@ const metrics: Metrics = {
   bytesSent: 0,
   lastResetTime: Date.now(),
 };
+
+/**
+ * Safely send a JSON-serializable payload to a WebSocket client.
+ *
+ * The async message handler runs concurrently per message and contains
+ * `await`s, so the underlying socket can transition out of OPEN between
+ * any two statements. The `ws` library throws synchronously if `send()`
+ * is called when `readyState !== OPEN`, which would otherwise crash the
+ * handler closure halfway through processing a message. This helper
+ * centralises three things every send must do:
+ *
+ *   1. Check `readyState === OPEN` to avoid the throw on a closed socket.
+ *   2. Honour `bufferedAmount <= MAX_BUFFER_BYTES` for backpressure.
+ *   3. Catch any residual TOCTOU race where the socket closes between
+ *      the check and the send call itself, logging it as debug rather
+ *      than letting the error escape the handler.
+ *
+ * On a successful send, metrics are bumped so observability stays
+ * accurate without callers having to remember to do it themselves.
+ */
+function safeSend(ws: WebSocket, payload: unknown): void {
+  if (ws.readyState !== WebSocket.OPEN) return;
+  if (ws.bufferedAmount > MAX_BUFFER_BYTES) return;
+  const serialized = JSON.stringify(payload);
+  try {
+    ws.send(serialized);
+    metrics.messagesSent++;
+    metrics.bytesSent += serialized.length;
+  } catch (err) {
+    logger.debug("safeSend dropped after socket transitioned out of OPEN", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
 
 // Reset rate metrics every minute for messages/sec and bytes/sec
 setInterval(() => {
@@ -294,7 +344,8 @@ function verifyWsToken(token: string, expectedSlab?: string): { isValid: boolean
     
     const [slabAddress, timestampStr, signature] = parts;
     const timestamp = parseInt(timestampStr, 10);
-    
+    if (Number.isNaN(timestamp)) return { isValid: false, slabAddress: null };
+
     // Check timestamp is within last 5 minutes and not in the future (30s clock skew tolerance)
     const now = Date.now();
     if (now - timestamp > 5 * 60 * 1000 || timestamp > now + 30_000) {
@@ -449,6 +500,11 @@ export function getWebSocketMetrics(): any {
 export function setupWebSocket(server: Server): WebSocketServer {
   const wss = new WebSocketServer({ server, maxPayload: 1024 });
 
+  // Idempotent re-entry: drop any listeners left over from a previous call
+  // (tests, hot reload, restart) before re-registering. The eventBus is a
+  // shared singleton, so without this listeners would accumulate.
+  cleanupEventBusListeners();
+
   wss.on("error", (err) => {
     logger.error("WebSocketServer error", {
       error: err instanceof Error ? err.message : String(err),
@@ -458,7 +514,7 @@ export function setupWebSocket(server: Server): WebSocketServer {
   const clients = new Set<WsClient>();
 
   // Broadcast price updates to subscribed clients (with batching)
-  eventBus.on("price.updated", (payload: any) => {
+  priceUpdatedListener = (payload: any) => {
     try {
       const slabAddress = payload.slabAddress;
 
@@ -486,10 +542,11 @@ export function setupWebSocket(server: Server): WebSocketServer {
     } catch (err) {
       logger.error("Error in price.updated handler", { error: err instanceof Error ? err.message : String(err) });
     }
-  });
+  };
+  eventBus.on("price.updated", priceUpdatedListener);
 
   // Broadcast trade events to subscribed clients
-  eventBus.on("trade.executed", (payload: any) => {
+  tradeExecutedListener = (payload: any) => {
     try {
       const slabAddress = payload.slabAddress;
       const channel = `trades:${slabAddress}`;
@@ -520,10 +577,11 @@ export function setupWebSocket(server: Server): WebSocketServer {
     } catch (err) {
       logger.error("Error in trade.executed handler", { error: err instanceof Error ? err.message : String(err) });
     }
-  });
+  };
+  eventBus.on("trade.executed", tradeExecutedListener);
 
   // Broadcast funding rate updates to subscribed clients
-  eventBus.on("funding.updated", (payload: any) => {
+  fundingUpdatedListener = (payload: any) => {
     try {
       const slabAddress = payload.slabAddress;
       const channel = `funding:${slabAddress}`;
@@ -552,7 +610,8 @@ export function setupWebSocket(server: Server): WebSocketServer {
     } catch (err) {
       logger.error("Error in funding.updated handler", { error: err instanceof Error ? err.message : String(err) });
     }
-  });
+  };
+  eventBus.on("funding.updated", fundingUpdatedListener);
 
   wss.on("connection", (ws, req: IncomingMessage) => {
     const clientIp = getClientIp(req);
@@ -703,7 +762,7 @@ export function setupWebSocket(server: Server): WebSocketServer {
       }, PONG_TIMEOUT_MS);
     }, HEARTBEAT_INTERVAL_MS);
 
-    ws.send(JSON.stringify({ type: "connected", message: "Percolator WebSocket connected" }));
+    safeSend(ws, { type: "connected", message: "Percolator WebSocket connected" });
 
     ws.on("error", (err) => {
       logger.warn("WebSocket connection error", {
@@ -722,7 +781,7 @@ export function setupWebSocket(server: Server): WebSocketServer {
         
         // Limit message size
         if (rawStr.length > 1024) {
-          ws.send(JSON.stringify({ type: "error", message: "Message too large" }));
+          safeSend(ws, { type: "error", message: "Message too large" });
           return;
         }
 
@@ -734,7 +793,7 @@ export function setupWebSocket(server: Server): WebSocketServer {
         }
         client.msgCount++;
         if (client.msgCount > CLIENT_MSG_LIMIT) {
-          ws.send(JSON.stringify({ type: "error", message: "Message rate limit exceeded" }));
+          safeSend(ws, { type: "error", message: "Message rate limit exceeded" });
           if (client.msgCount === CLIENT_MSG_LIMIT + 1) {
             logger.warn("Client message rate limit exceeded", { ip: client.ip });
           }
@@ -761,7 +820,7 @@ export function setupWebSocket(server: Server): WebSocketServer {
                 currentSlab: client.authenticatedSlab,
                 requestedSlab: newSlab,
               });
-              ws.send(JSON.stringify({ type: "error", message: "Already authenticated — disconnect to change slab binding" }));
+              safeSend(ws, { type: "error", message: "Already authenticated — disconnect to change slab binding" });
               return;
             }
           }
@@ -784,7 +843,7 @@ export function setupWebSocket(server: Server): WebSocketServer {
                   ip: client.ip,
                   count: ipCount,
                 });
-                ws.send(JSON.stringify({ type: "error", message: "Authenticated connection limit reached" }));
+                safeSend(ws, { type: "error", message: "Authenticated connection limit reached" });
                 ws.close(1008, "Connection limit reached");
                 return;
               }
@@ -802,22 +861,22 @@ export function setupWebSocket(server: Server): WebSocketServer {
               ip: client.ip, 
               slab: client.authenticatedSlab 
             });
-            ws.send(JSON.stringify({ 
-              type: "authenticated", 
-              slabBinding: client.authenticatedSlab 
-            }));
+            safeSend(ws, {
+              type: "authenticated",
+              slabBinding: client.authenticatedSlab,
+            });
           } else {
             logger.warn("Invalid auth token in message", { ip: client.ip });
             // Record auth failure for rate limiting (issue #839)
             recordAuthFailure(client.ip);
-            ws.send(JSON.stringify({ type: "error", message: "Invalid authentication token" }));
+            safeSend(ws, { type: "error", message: "Invalid authentication token" });
           }
           return;
         }
         
         // If auth required and not authenticated, reject all other messages
         if (WS_AUTH_REQUIRED && !client.authenticated) {
-          ws.send(JSON.stringify({ type: "error", message: "Authentication required" }));
+          safeSend(ws, { type: "error", message: "Authentication required" });
           return;
         }
         
@@ -825,7 +884,7 @@ export function setupWebSocket(server: Server): WebSocketServer {
         if (msg.type === "subscribe" && msg.channels && Array.isArray(msg.channels)) {
           const MAX_CHANNELS_PER_MESSAGE = 50;
           if (msg.channels.length > MAX_CHANNELS_PER_MESSAGE) {
-            ws.send(JSON.stringify({ type: "error", message: `Max ${MAX_CHANNELS_PER_MESSAGE} channels per subscribe message` }));
+            safeSend(ws, { type: "error", message: `Max ${MAX_CHANNELS_PER_MESSAGE} channels per subscribe message` });
             return;
           }
 
@@ -904,17 +963,26 @@ export function setupWebSocket(server: Server): WebSocketServer {
           }
           
           if (subscribed.length > 0) {
-            ws.send(JSON.stringify({ type: "subscribed", channels: subscribed }));
+            safeSend(ws, { type: "subscribed", channels: subscribed });
             
             // Send initial data for price channels
             for (const channel of subscribed) {
               if (channel.startsWith("price:")) {
                 const slab = channel.split(":")[1];
                 try {
+                  // Bound the upstream call: this is best-effort UX data, and
+                  // the message handler is async so each subscribed channel
+                  // spawns its own in-flight query. Without a per-query
+                  // timeout a slow Supabase response would let queries pile
+                  // up per client, exhausting the connection pool and
+                  // stalling handler closures indefinitely. AbortSignal is
+                  // the same idiom oracle-router.ts uses, and it actually
+                  // cancels the underlying fetch — not just the await.
                   const { data: stats, error } = await getSupabase()
                     .from("market_stats")
                     .select("last_price, mark_price, index_price, updated_at")
                     .eq("slab_address", slab)
+                    .abortSignal(AbortSignal.timeout(WS_INITIAL_PRICE_QUERY_TIMEOUT_MS))
                     .single();
 
                   if (error) {
@@ -926,22 +994,18 @@ export function setupWebSocket(server: Server): WebSocketServer {
                   }
 
                   if (stats && stats.last_price) {
-                    if (ws.readyState === WebSocket.OPEN && ws.bufferedAmount <= MAX_BUFFER_BYTES) {
-                      // market_stats.last_price / mark_price / index_price are
-                      // stored as DOLLAR values (not e6-scaled), unlike
-                      // oracle_prices.price_e6. Previously we divided again by
-                      // 1e6 and sent \$0.00008555 on subscribe.
-                      ws.send(
-                        JSON.stringify({
-                          type: "price",
-                          slab,
-                          price: stats.last_price,
-                          markPrice: stats.mark_price ?? undefined,
-                          indexPrice: stats.index_price ?? undefined,
-                          timestamp: stats.updated_at,
-                        }),
-                      );
-                    }
+                    // market_stats.last_price / mark_price / index_price are
+                    // stored as DOLLAR values (not e6-scaled), unlike
+                    // oracle_prices.price_e6. Previously we divided again by
+                    // 1e6 and sent $0.00008555 on subscribe.
+                    safeSend(ws, {
+                      type: "price",
+                      slab,
+                      price: stats.last_price,
+                      markPrice: stats.mark_price ?? undefined,
+                      indexPrice: stats.index_price ?? undefined,
+                      timestamp: stats.updated_at,
+                    });
                   }
                 } catch (err) {
                   logger.warn("Failed to fetch initial price for subscription", {
@@ -954,20 +1018,20 @@ export function setupWebSocket(server: Server): WebSocketServer {
           }
           
           if (errors.length > 0) {
-            ws.send(JSON.stringify({ type: "error", message: errors.join("; ") }));
+            safeSend(ws, { type: "error", message: errors.join("; ") });
           }
         }
         // Legacy: single slab subscription (backward compatibility)
         else if (msg.type === "subscribe" && msg.slabAddress) {
           const sanitized = sanitizeSlabAddress(msg.slabAddress);
           if (!sanitized) {
-            ws.send(JSON.stringify({ type: "error", message: "Invalid slab address" }));
+            safeSend(ws, { type: "error", message: "Invalid slab address" });
             return;
           }
 
           // Reject blocked/phantom slabs
           if (isBlockedSlab(sanitized)) {
-            ws.send(JSON.stringify({ type: "error", message: "Market not found" }));
+            safeSend(ws, { type: "error", message: "Market not found" });
             return;
           }
           
@@ -978,43 +1042,50 @@ export function setupWebSocket(server: Server): WebSocketServer {
               authenticatedSlab: client.authenticatedSlab, 
               requestedSlab: sanitized 
             });
-            ws.send(JSON.stringify({
+            safeSend(ws, {
               type: "error",
-              message: "Cannot subscribe — token is bound to a different market"
-            }));
+              message: "Cannot subscribe — token is bound to a different market",
+            });
             return;
           }
           
           // Check per-slab connection limit before subscribing
           const slabClients = connectionsPerSlab.get(sanitized);
           if (slabClients && slabClients.size >= MAX_CONNECTIONS_PER_SLAB) {
-            ws.send(JSON.stringify({ type: "error", message: "Connection limit for this market reached" }));
+            safeSend(ws, { type: "error", message: "Connection limit for this market reached" });
             return;
           }
 
           // Subscribe to all channels for this slab (backward compatibility)
           const channels = [`price:${sanitized}`, `trades:${sanitized}`, `funding:${sanitized}`];
-          ws.send(JSON.stringify({ 
-            type: "info", 
-            message: "Please use channels array. Subscribing to all channels for this slab." 
-          }));
+          safeSend(ws, {
+            type: "info",
+            message: "Please use channels array. Subscribing to all channels for this slab.",
+          });
           
+          const subscribed: string[] = [];
           for (const channel of channels) {
             if (client.subscriptions.has(channel)) continue;
             if (globalSubscriptionCount >= MAX_GLOBAL_SUBSCRIPTIONS) break;
             if (client.subscriptions.size >= MAX_SUBSCRIPTIONS_PER_CLIENT) break;
-            
+
             client.subscriptions.add(channel);
             globalSubscriptionCount++;
+            subscribed.push(channel);
           }
-          
-          addClientToSlab(client, sanitized);
-          ws.send(JSON.stringify({ type: "subscribed", slabAddress: sanitized, channels }));
+
+          if (subscribed.length > 0) {
+            addClientToSlab(client, sanitized);
+          }
+          safeSend(ws, { type: "subscribed", slabAddress: sanitized, channels: subscribed });
+          if (subscribed.length < channels.length) {
+            safeSend(ws, { type: "error", message: "Subscription limit reached — some channels were not subscribed" });
+          }
         }
         // Handle unsubscribe with channels array
         else if (msg.type === "unsubscribe" && msg.channels && Array.isArray(msg.channels)) {
           if (msg.channels.length > MAX_SUBSCRIPTIONS_PER_CLIENT) {
-            ws.send(JSON.stringify({ type: "error", message: "Too many channels in unsubscribe message" }));
+            safeSend(ws, { type: "error", message: "Too many channels in unsubscribe message" });
             return;
           }
 
@@ -1039,7 +1110,7 @@ export function setupWebSocket(server: Server): WebSocketServer {
           }
           
           if (unsubscribed.length > 0) {
-            ws.send(JSON.stringify({ type: "unsubscribed", channels: unsubscribed }));
+            safeSend(ws, { type: "unsubscribed", channels: unsubscribed });
           }
         }
         // Legacy: single slab unsubscribe
@@ -1057,14 +1128,12 @@ export function setupWebSocket(server: Server): WebSocketServer {
             }
             
             removeClientFromSlab(client, sanitized);
-            ws.send(JSON.stringify({ type: "unsubscribed", slabAddress: sanitized, channels: unsubscribed }));
+            safeSend(ws, { type: "unsubscribed", slabAddress: sanitized, channels: unsubscribed });
           }
         }
       } catch (err) {
         logger.warn("Error processing WS message", { ip: client.ip, error: err });
-        if (ws.readyState === WebSocket.OPEN && ws.bufferedAmount <= MAX_BUFFER_BYTES) {
-          ws.send(JSON.stringify({ type: "error", message: "Invalid message" }));
-        }
+        safeSend(ws, { type: "error", message: "Invalid message" });
       }
     });
 
@@ -1133,4 +1202,28 @@ export function cleanupPriceUpdateTimers(): void {
   }
   priceUpdateTimers.clear();
   pendingPriceUpdates.clear();
+}
+
+/**
+ * Remove the eventBus listeners registered by setupWebSocket().
+ *
+ * The eventBus is a shared singleton (re-imported from @percolator/shared),
+ * so listeners registered inside setupWebSocket() persist across module
+ * reloads. Without this helper they would accumulate on every test that
+ * resets modules and on every graceful shutdown / restart cycle, causing
+ * duplicate broadcasts and a slow memory leak. Safe to call multiple times.
+ */
+export function cleanupEventBusListeners(): void {
+  if (priceUpdatedListener) {
+    eventBus.off("price.updated", priceUpdatedListener);
+    priceUpdatedListener = null;
+  }
+  if (tradeExecutedListener) {
+    eventBus.off("trade.executed", tradeExecutedListener);
+    tradeExecutedListener = null;
+  }
+  if (fundingUpdatedListener) {
+    eventBus.off("funding.updated", fundingUpdatedListener);
+    fundingUpdatedListener = null;
+  }
 }

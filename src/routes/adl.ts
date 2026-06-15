@@ -51,6 +51,8 @@ import {
   createLogger,
   sanitizeSlabAddress,
 } from "@percolator/shared";
+import { withRpcFallback } from "../utils/rpc-fallback.js";
+import { RpcTimeoutError } from "../utils/rpc-timeout.js";
 import { isBlockedSlab } from "../middleware/validateSlab.js";
 
 const logger = createLogger("api:adl");
@@ -180,6 +182,11 @@ export function adlRoutes(): Hono {
     // Check cache to avoid redundant expensive RPC calls
     const cached = adlCache.get(slab);
     if (cached && Date.now() - cached.fetchedAt < ADL_CACHE_TTL_MS) {
+      // Promote to most-recently-used so the FIFO-by-insertion eviction
+      // at lines below behaves as LRU. Without this, hot keys inserted
+      // early get evicted while cold keys inserted later survive.
+      adlCache.delete(slab);
+      adlCache.set(slab, cached);
       return c.json(cached.data, 200, { "X-Cache": "HIT" });
     }
 
@@ -193,11 +200,18 @@ export function adlRoutes(): Hono {
       return c.json({ error: "Market not found" }, 404);
     }
 
-    const connection = getConnection();
     let data: Uint8Array;
     try {
-      data = await fetchSlab(connection, new PublicKey(slab));
+      data = await withRpcFallback(
+        (conn) => fetchSlab(conn, new PublicKey(slab)),
+        getConnection(),
+        `fetchSlab(${slab})`,
+      );
     } catch (err) {
+      if (err instanceof RpcTimeoutError) {
+        logger.warn("RPC timeout fetching slab for ADL", { slab, timeoutMs: err.timeoutMs });
+        return c.json({ error: "Upstream RPC timeout", slab }, 504);
+      }
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes("not found")) {
         return c.json({ error: "Slab account not found", slab }, 404);

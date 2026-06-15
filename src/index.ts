@@ -3,6 +3,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { compress } from "hono/compress";
 import { bodyLimit } from "hono/body-limit";
+import { requestId } from "hono/request-id";
 import { serve } from "@hono/node-server";
 import { createLogger, sendInfoAlert, getSupabase, sendCriticalAlert, truncateErrorMessage } from "@percolator/shared";
 import { initSentry, sentryMiddleware, flushSentry } from "./middleware/sentry.js";
@@ -24,7 +25,7 @@ import { chartRoutes } from "./routes/chart.js";
 import { candleRoutes } from "./routes/candles.js";
 import { docsRoutes } from "./routes/docs.js";
 import { adlRoutes } from "./routes/adl.js";
-import { setupWebSocket, cleanupPriceUpdateTimers } from "./routes/ws.js";
+import { setupWebSocket, cleanupPriceUpdateTimers, cleanupEventBusListeners } from "./routes/ws.js";
 import { OraclePriceBroadcaster } from "./services/OraclePriceBroadcaster.js";
 import { readRateLimit, writeRateLimit } from "./middleware/rate-limit.js";
 import { ipBlocklist } from "./middleware/ip-blocklist.js";
@@ -53,6 +54,27 @@ if (!process.env.SUPABASE_URL) {
 if (!process.env.SUPABASE_SERVICE_KEY) {
   logger.error("SUPABASE_SERVICE_KEY environment variable is required");
   process.exit(1);
+}
+
+// In production, API_AUTH_KEY must be configured. Treat empty / whitespace-only
+// as not configured: the runtime check in src/middleware/auth.ts uses `!apiAuthKey`
+// which would falsely accept "   " as a key. Catching this at startup turns a
+// silent fail-late misconfig (HTTP 500 on first protected request) into a hard
+// boot failure that deploy pipelines and health checks will surface immediately.
+if (process.env.NODE_ENV === "production" && !process.env.API_AUTH_KEY?.trim()) {
+  logger.error(
+    "API_AUTH_KEY environment variable is required in production and cannot be empty or whitespace",
+  );
+  process.exit(1);
+}
+
+// In non-production, log a clear warning if auth is disabled. This catches the
+// common "I forgot to set NODE_ENV=production" mistake before the misconfigured
+// service is exposed to real traffic.
+if (process.env.NODE_ENV !== "production" && !process.env.API_AUTH_KEY?.trim()) {
+  logger.warn(
+    "API_AUTH_KEY is not set — API authentication is disabled (non-production mode)",
+  );
 }
 
 logger.info("CORS allowed origins", { origins: allowedOrigins });
@@ -107,6 +129,10 @@ app.use("*", bodyLimit({
   maxSize: 100 * 1024, // 100KB
   onError: (c) => c.json({ error: "Request body too large" }, 413),
 }));
+
+// Request ID — generates a UUID per request for log correlation and debugging.
+// Respects incoming X-Request-Id headers (e.g., from load balancers).
+app.use("*", requestId());
 
 // Default-deny for mutation methods. Until write endpoints are added,
 // reject any POST/PUT/DELETE/PATCH requests that reach the API.
@@ -214,13 +240,15 @@ app.get("/", (c) => c.json({
 
 // Global error handler
 app.onError((err, c) => {
+  const reqId = c.get("requestId");
   logger.error("Unhandled error", {
+    requestId: reqId,
     error: truncateErrorMessage(err.message, 120),
     stack: truncateErrorMessage(err.stack ?? "", 500),
     endpoint: c.req.path,
     method: c.req.method
   });
-  
+
   // Report to Sentry (sentryMiddleware may have already captured it,
   // but this ensures errors from middleware chain are also caught)
   try {
@@ -229,14 +257,16 @@ app.onError((err, c) => {
         endpoint: c.req.path,
         method: c.req.method,
         handler: "onError",
+        request_id: reqId,
       },
     });
   } catch (_sentryErr) {}
-  
+
   // Truncate error message for API response (details only in development)
   const showDetails = process.env.NODE_ENV !== "production";
   return c.json({
     error: "Internal server error",
+    requestId: reqId,
     ...(showDetails && { details: truncateErrorMessage(err.message, 200) })
   }, 500);
 });
@@ -249,7 +279,7 @@ if (!process.env.NODE_ENV || !validNodeEnvs.includes(process.env.NODE_ENV)) {
     nodeEnv: process.env.NODE_ENV ?? "(unset)",
     validOptions: validNodeEnvs.join(", ")
   });
-  throw new Error(`NODE_ENV must be explicitly set. Got: ${process.env.NODE_ENV ?? "(unset)"}. Must be one of: ${validNodeEnvs.join(", ")}`);
+  process.exit(1);
 }
 
 const port = Number(process.env.API_PORT ?? 3001);
@@ -357,8 +387,11 @@ async function shutdown(signal: string): Promise<void> {
       { name: "Signal", value: signal, inline: true },
     ]);
 
-    // Clean up pending price update timers before closing connections
+    // Clean up pending price update timers and unsubscribe shared eventBus
+    // listeners before closing connections, so they don't keep stale state
+    // alive past the process lifetime.
     cleanupPriceUpdateTimers();
+    cleanupEventBusListeners();
 
     // Terminate all active WebSocket connections so they don't hold the server open
     for (const client of wss.clients) {
