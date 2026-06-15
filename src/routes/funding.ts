@@ -71,7 +71,7 @@ export function fundingRoutes(): Hono {
       async () => {
         const { data: allStats, error } = await getSupabase()
           .from("markets_with_stats")
-          .select("slab_address, funding_rate, net_lp_pos, asset_index")
+          .select("slab_address, funding_rate, net_lp_pos")
           .eq("network", getNetwork())
           .not("slab_address", "is", null);
 
@@ -141,8 +141,9 @@ export function fundingRoutes(): Hono {
       // metadata.last_price. Falls back gracefully if market row is missing.
       const { data: stats, error: statsError } = await getSupabase()
         .from("markets_with_stats")
-        // v17: select asset_index for per-asset funding. Pre-v17 rows return null → default 0.
-        .select("funding_rate, net_lp_pos, symbol, last_price, asset_index")
+        // asset_index is not in the markets_with_stats schema (no migration defines it) — selecting it
+        // causes a PostgREST 400. Downstream defaults assetIndex to 0. Same fix as crank.ts (e471efb).
+        .select("funding_rate, net_lp_pos, symbol, last_price")
         .eq("slab_address", slab)
         .single();
 
