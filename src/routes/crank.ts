@@ -11,12 +11,13 @@ export function crankStatusRoutes(): Hono {
     const result = await withDbCacheFallback(
       "crank:status",
       async () => {
-        // v17: select asset_index for per-asset crank tracking. Pre-v17 rows return null (defaults to 0).
-        // In v17 PermissionlessCrank (tag 5) takes an asset_index u16 — the indexer
-        // writes one row per (slab, asset_index) pair so callers can monitor per-asset crank lag.
+        // Select only columns that exist in the markets_with_stats view.
+        // asset_index is NOT in the schema (no migration defines it) — selecting it
+        // causes a PostgREST 400 which makes withDbCacheFallback return 503 on every call.
+        // Per-asset crank tracking is not implemented in the data layer; remove the column.
         const { data, error } = await getSupabase()
           .from("markets_with_stats")
-          .select("slab_address, last_crank_slot, updated_at, asset_index")
+          .select("slab_address, last_crank_slot, updated_at")
           .eq("network", getNetwork())
           .not("slab_address", "is", null);
         if (error) throw error;
@@ -24,10 +25,6 @@ export function crankStatusRoutes(): Hono {
           slabAddress: row.slab_address,
           lastCrankSlot: row.last_crank_slot ?? null,
           updatedAt: row.updated_at ?? null,
-          // v17: per-asset index (null from pre-v17 indexer → 0).
-          assetIndex: (row as Record<string, unknown>).asset_index != null
-            ? Number((row as Record<string, unknown>).asset_index)
-            : 0,
         }));
       },
       c

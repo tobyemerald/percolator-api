@@ -147,13 +147,12 @@ describe("crank routes", () => {
 
       expect(res.status).toBe(200);
       const data = await res.json();
-      // v17: camelCase field names; assetIndex added for per-asset crank tracking
+      // v17: camelCase field names
       expect(data.markets[0]).toHaveProperty("slabAddress");
       expect(data.markets[0]).toHaveProperty("lastCrankSlot");
       expect(data.markets[0]).toHaveProperty("updatedAt");
-      expect(data.markets[0]).toHaveProperty("assetIndex");
-      // pre-v17 rows have no asset_index → defaults to 0
-      expect(data.markets[0].assetIndex).toBe(0);
+      // asset_index is not in the schema (no migration); removed from SELECT to fix PostgREST 400
+      expect(data.markets[0]).not.toHaveProperty("assetIndex");
     });
 
     it("should handle large slot numbers", async () => {
